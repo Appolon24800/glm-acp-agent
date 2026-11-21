@@ -71,7 +71,8 @@ import {
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
-import { debug, error, isDebugEnabled } from "../llm/logger.js";
+import { debug, error, isDebugEnabled, warn } from "../llm/logger.js";
+import { globalContextSetting } from "../llm/config-paths.js";
 import { validateStreamCompletion } from "../llm/stream-state.js";
 import {
   appendCompactionNote,
@@ -90,6 +91,8 @@ import {
  * files in their AGENTS.md.
  */
 const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
+/** Cap for the user-level global instructions file. */
+const GLOBAL_CONTEXT_CAP_CHARS = 16 * 1024;
 // Four UTF-8 bytes per character bounds disk I/O while retaining the existing
 // character cap even for non-ASCII project instructions.
 const PROJECT_CONTEXT_CAP_BYTES = PROJECT_CONTEXT_CAP_CHARS * 4;
@@ -461,7 +464,7 @@ export class GlmAcpAgent implements Agent {
     try {
       const mcpTools = await setup.tools;
       const toolDefinitions = this.availableToolDefinitions(mcpTools);
-      const agentsMd = await loadProjectContext(params.cwd);
+      const context = await loadPromptContext(params.cwd);
       if (this.shuttingDown) throw new Error("Agent is shutting down");
 
     const systemPrompt: GlmMessage = {
@@ -469,7 +472,8 @@ export class GlmAcpAgent implements Agent {
       content: buildSystemPrompt({
         cwd: params.cwd,
         tools: toolDefinitions.map((tool) => tool.function.name),
-        agentsMd,
+        agentsMd: context.project,
+        globalMd: context.global,
       }),
     };
 
@@ -1395,12 +1399,12 @@ export class GlmAcpAgent implements Agent {
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
-        const agentsMd = await loadProjectContext(params.cwd, forkAbortController.signal);
+        const context = await loadPromptContext(params.cwd, forkAbortController.signal);
         if (this.shuttingDown) throw new Error("Agent is shutting down");
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
-        const response = await this.createFork(params, persisted, provisional, agentsMd, forkAbortController.signal);
+        const response = await this.createFork(params, persisted, provisional, context, forkAbortController.signal);
         provisional = null;
         return response;
       } catch (primaryError) {
@@ -1433,7 +1437,7 @@ export class GlmAcpAgent implements Agent {
     params: ForkSessionRequest,
     persisted: PersistedSession,
     mcpTools: SessionMcpTools,
-    agentsMd: string | undefined,
+    context: PromptContext,
     signal: AbortSignal,
   ): Promise<ForkSessionResponse> {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
@@ -1445,7 +1449,7 @@ export class GlmAcpAgent implements Agent {
       structuredClone(persisted.messages),
       params.cwd,
       toolDefinitions,
-      agentsMd,
+      context,
     );
     const forkLifecycle = new SessionLifecycle();
     const forked: SessionState = {
@@ -1585,7 +1589,7 @@ export class GlmAcpAgent implements Agent {
         }
 
         const toolDefinitions = this.availableToolDefinitions(provisional);
-        const agentsMd = await loadProjectContext(params.cwd, restoreAbortController.signal);
+        const context = await loadPromptContext(params.cwd, restoreAbortController.signal);
         this.assertRestoreOwner(lifecycle, lease);
         // Configuration updates remain responsive while MCP setup is in
         // flight. Prompts are gated, so this second live projection keeps
@@ -1595,7 +1599,7 @@ export class GlmAcpAgent implements Agent {
           restoreSource.messages,
           params.cwd,
           toolDefinitions,
-          agentsMd,
+          context,
         );
         const restored: SessionState = {
           cwd: params.cwd,
@@ -2465,14 +2469,15 @@ function rebuildRestoredMessages(
   messages: GlmMessage[],
   cwd: string,
   toolDefinitions: ReadonlyArray<ToolDefinition>,
-  agentsMd: string | undefined,
+  context: PromptContext,
 ): GlmMessage[] {
   const systemPrompt: GlmMessage = {
     role: "system",
     content: buildSystemPrompt({
       cwd,
       tools: toolDefinitions.map((tool) => tool.function.name),
-      agentsMd,
+      agentsMd: context.project,
+      globalMd: context.global,
     }),
   };
   return messages[0]?.role === "system"
@@ -2787,6 +2792,47 @@ async function loadProjectContext(cwd: string, signal?: AbortSignal): Promise<st
     return contents;
   }
   return undefined;
+}
+
+/** Context files folded into a session's system prompt. */
+interface PromptContext {
+  /** `AGENTS.md` / `CLAUDE.md` from the session cwd. */
+  project: string | undefined;
+  /** User-level instructions from the global context file. */
+  global: string | undefined;
+}
+
+/**
+ * Read the global instructions file, capped to {@link GLOBAL_CONTEXT_CAP_CHARS}
+ * characters. Only a missing file at the default location is silent; a missing
+ * or unreadable file the user configured explicitly, or an invalid setting,
+ * is reported on stderr so a typo does not look like "rules are active".
+ */
+async function loadGlobalContext(signal?: AbortSignal): Promise<string | undefined> {
+  const setting = globalContextSetting();
+  if (setting.problem !== undefined) warn(setting.problem);
+  if (setting.path === undefined) return undefined;
+  let contents: string;
+  try {
+    contents = await readLocalTextPrefix(setting.path, GLOBAL_CONTEXT_CAP_CHARS * 4, signal);
+  } catch (err) {
+    if (signal?.aborted) throw new Error("The operation was aborted", { cause: err });
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (setting.explicit || code !== "ENOENT") {
+      warn(`Could not read global context file ${setting.path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return undefined;
+  }
+  if (contents.length > GLOBAL_CONTEXT_CAP_CHARS) {
+    contents = contents.slice(0, GLOBAL_CONTEXT_CAP_CHARS);
+    if (/[\uD800-\uDBFF]$/.test(contents)) contents = contents.slice(0, -1);
+  }
+  return contents;
+}
+
+async function loadPromptContext(cwd: string, signal?: AbortSignal): Promise<PromptContext> {
+  const [project, global] = await Promise.all([loadProjectContext(cwd, signal), loadGlobalContext(signal)]);
+  return { project, global };
 }
 
 /** sessionUpdate that swallows transport errors during error reporting. */
